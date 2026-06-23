@@ -32,6 +32,10 @@ import json
 import traceback
 import threading
 
+from pathlib import Path
+from src.manager import DefManager
+from handlers.baseapp_handler import BaseAppHandler
+
 sys.stdout.reconfigure(line_buffering=True)
 
 HOST       = '0.0.0.0'
@@ -47,6 +51,23 @@ from Crypto.PublicKey import RSA
 from Crypto.Cipher   import PKCS1_OAEP
 from Crypto.Cipher   import Blowfish as BF_ECB
 from Crypto.Hash     import SHA1
+
+# Инициализация парсера
+app_root = Path(__file__).resolve().parent
+def_manager = DefManager(app_root)
+def_manager.load() # Это та самая функция, которая выводит [DEF] ... - is found
+print(f"[OK] DefManager готов: {len(def_manager)} сущностей в реестре")
+
+handler = BaseAppHandler(def_manager=def_manager)
+
+# ── Entity System ──
+try:
+    from entity_addon import EntitySystemAddon
+    ENTITY_ADDON = True
+    print('[OK] EntitySystemAddon загружен')
+except ImportError:
+    ENTITY_ADDON = False
+    print('[WARN] EntitySystemAddon не загружен (опционально)')
 
 # ── Логика авторизации вынесена в auth_logic.py (тот же каталог) ──
 from auth_logic import (
@@ -624,7 +645,7 @@ class LoginApp:
 # ───────────────────────────────────────────────────────────────
 class BaseAppStub:
 
-    def __init__(self):
+    def __init__(self, def_manager):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.sock.bind((HOST, BASE_PORT))
@@ -632,6 +653,12 @@ class BaseAppStub:
         self._log_path  = os.path.join(LOG_DIR, 'baseapp.log')
         self._seq       = 0
         self._clients   = {}  # addr → BaseAppHandshake (SYN→ACK автомат)
+        self.handler = BaseAppHandler(def_manager=def_manager)
+        
+        # Entity System
+        if ENTITY_ADDON:
+            self.entity_system = EntitySystemAddon()
+            self.entity_system.initialize()
         print(f'[BASE]  Listening  UDP {HOST}:{BASE_PORT}')
 
     def _log(self, msg: str, addr=None, level: str = 'INFO'):
@@ -667,19 +694,25 @@ class BaseAppStub:
             hs = BaseAppHandshake()
             self._clients[addr] = hs
 
-        # baseAppLogin — это REQUEST (флаг HAS_REQUESTS=0x0001). Клиент ждёт REPLY
-        # (как у LoginApp), а не пустой ACK. reply_id лежит на BASEAPP_REPLYID_OFFSET.
-        if (flags & FLAG_HAS_REQUESTS) and len(data) >= BASEAPP_REPLYID_OFFSET + 4:
-            reply_id = struct.unpack_from('<I', data, BASEAPP_REPLYID_OFFSET)[0]
-            reply = generate_baseapp_login_reply(reply_id, session_key=LOGIN_KEY)
-            self._log(f'>> baseAppLogin REPLY ({len(reply)}B) reply_id={reply_id} '
-                      f'hex={reply.hex(" ")}', addr)
+        # Проверяем наличие флага HAS_REQUESTS (0x0001)
+        if (flags & 0x0001) and len(data) >= 11: # BASEAPP_REPLYID_OFFSET обычно 7
+            
+            # --- ВЫЗЫВАЕМ ТВОЙ ХЕНДЛЕР ---
+            reply, info = self.handler.handle_baseapp_login(data, addr)
+            
+            if reply:
+                self._log(f'>> baseAppLogin REPLY ({len(reply)}B) '
+                          f'hex={reply.hex(" ")}', addr)
+                self.sock.sendto(reply, addr)
+            
+            # Если нужно — сохраняем данные сессии в hs или self._clients[addr]
+            # hs.session_info = info 
+            
         else:
             # маленький/без-request пакет → пустой канальный ACK
             reply = hs.build_ack(0)
             self._log(f'>> ACK ({len(reply)}B)', addr)
-
-        self.sock.sendto(reply, addr)
+            self.sock.sendto(reply, addr)
 
     def _send_ack(self, addr, req_id: int, client_seq: int):
         """Пустой ACK — подтверждаем что пакет получен."""
@@ -708,20 +741,34 @@ class BaseAppStub:
 # ───────────────────────────────────────────────────────────────
 #  Точка входа
 # ───────────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────
+# Точка входа
+# ───────────────────────────────────────────────────────────────
 def main():
     print()
     print('╔' + '═' * 58 + '╗')
-    print('║  WoT/Mir Tankov 1.23 · BigWorld LoginApp+BaseApp stub  ║')
-    print('║  Fixed: Variable32 element len · correct payload fmt   ║')
+    print('║  WoT/Mir Tankov 1.23 · BigWorld LoginApp+BaseApp stub   ║')
+    print('║  Fixed: Variable32 element len · correct payload fmt    ║')
     print('╚' + '═' * 58 + '╝')
     print()
 
-    base_stub = BaseAppStub()
+    # 1. Инициализация DefManager (парсер данных)
+    print('[SYSTEM] Loading .def files...')
+    def_manager = DefManager(root_path='.')
+    def_manager.load()  # Загружаем структуры данных
+    print(f'[SYSTEM] DefManager loaded with {len(def_manager)} entities')
+
+    # 2. Инициализация BaseAppStub с передачей def_manager
+    # Теперь конструктор BaseAppStub принимает наш def_manager
+    base_stub = BaseAppStub(def_manager=def_manager)
+    
+    # 3. Запуск BaseApp в отдельном потоке
     base_thread = threading.Thread(target=base_stub.run, daemon=True, name='BaseApp')
     base_thread.start()
 
+    # 4. Запуск LoginApp (блокирующий вызов)
     login_app = LoginApp()
-    login_app.run()   # блокирует
+    login_app.run() 
 
 
 if __name__ == '__main__':
