@@ -834,7 +834,7 @@ class BaseAppStub:
             seq_num       = ch.next_seq(),   # ← seq РАСТЁТ
             last_rel      = ch.client_seq,   # ← подтверждаем последний seq клиента
             extra_flags   = extra,
-            prefix_offset = 0,               # наш TX offset всегда 0
+            prefix_offset = getattr(ch, 'prefix_offset', 0),   # FIX: use client per-connection offset
         )
         self.sock.sendto(pkt, addr)
         return pkt
@@ -914,6 +914,7 @@ class BaseAppStub:
         flags = struct.unpack_from('<H', data, 4)[0]
         ch = self._channels.setdefault(addr, ClientChannel())
         ch.last_client_prefix = client_prefix_raw
+        ch.prefix_offset = client_offset   # FIX: outgoing must use client per-connection offset
 
         # ── ФАЗА 1: Обработка off-channel baseAppLogin ──────
         if (flags & FLAG_HAS_REQUESTS) and len(data) >= 14:
@@ -937,7 +938,7 @@ class BaseAppStub:
                     self._sessions[addr] = session_key
                 sk  = struct.pack('<I', session_key)
                 elt = build_reply_element(request_id, sk)
-                pkt = build_bw_packet(elt, is_on_channel=False, prefix_offset=0)
+                pkt = build_bw_packet(elt, is_on_channel=False, prefix_offset=client_offset)
                 sent = self.sock.sendto(pkt, addr)
                 self._log(f'>> SessionKey key=0x{session_key:08X} req_id=0x{request_id:08X} login_key=0x{login_key_client:08X} ({len(pkt)}B) sent={sent}', addr)
                 self._log(f'   reply hex={pkt.hex(chr(32))}', addr)
