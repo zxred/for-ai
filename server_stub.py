@@ -78,6 +78,7 @@ def _client_seq_from_packet(data: bytes) -> int:
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from entity_streaming import build_account_create_base_player_element
 from account_properties import send_receive_properties, build_receive_properties_element   # stats/inventory/serverSettings
+from show_gui import build_show_gui_payload   # Account.showGUI -> Hangar
 
 sys.stdout.reconfigure(line_buffering=True)
 
