@@ -42,12 +42,42 @@ try:
     from types_parser import BASIC_TYPES, pack_primitive  # noqa: F401
 except Exception:
     BASIC_TYPES, pack_primitive = {}, None
+       
+# ── per-client channel state ──────────────────────────────────────
+class ClientChannel:
+    """Состояние reliable-канала одного клиента (wg-toolkit ClientChannel)."""
+    def __init__(self):
+        self.established   = False   # пришёл ли on-channel SessionKey (0x01)
+        self.our_seq       = 0       # наш счётчик исходящих reliable-пакетов
+        self.client_seq    = 0       # последний seq, полученный от клиента (для last_rel)
+        self.first_channel_pkt = True  # нужен флаг CREATE_CHANNEL на 1-м пакете
+
+    def next_seq(self) -> int:
+        s = self.our_seq
+        self.our_seq += 1
+        return s
+
+
+FLAG_HAS_REQUESTS = 0x0001
+FLAG_IS_ON_CHANNEL = 0x0008
+FLAG_CREATE_CHANNEL = 0x0200   # ← КЛЮЧЕВОЙ флаг для первого канального пакета
+
+
+def _client_seq_from_packet(data: bytes) -> int:
+    """Вытащить seq клиента из on-channel пакета (footer: last_rel:4, seq:4)."""
+    # хвост = [... last_rel:4][seq:4][checksum:4]  (если HAS_CHECKSUM)
+    # seq лежит на -8 от конца, если есть checksum; иначе -4.
+    flags = struct.unpack_from('<H', data, 4)[0]
+    has_cs = bool(flags & 0x0100)
+    end = len(data) - (4 if has_cs else 0)
+    return struct.unpack_from('<I', data, end - 4)[0]
 
 # ── Entity stream serializer (createBasePlayer) ──────────────────────────
 # Кладём entity_streaming.py рядом с этим файлом; добавляем его каталог в
 # sys.path, чтобы импорт работал независимо от cwd.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from entity_streaming import build_account_create_base_player_element
+from account_properties import send_receive_properties   # stats/inventory/serverSettings
 
 sys.stdout.reconfigure(line_buffering=True)
 
@@ -127,9 +157,9 @@ RSA_BLOCK_SIZE = 256
 #   подвинь это значение (частые варианты: 7 для Fixed, 9 для Variable16).
 REPLY_ID_OFFSET = 9
 
-# На BaseApp baseAppLogin reply_id лежит со смещения 7 (фиксированный элемент,
-# без inline-длины). Если клиент не матчит reply — попробуй 9.
-BASEAPP_REPLYID_OFFSET = 7
+# На BaseApp baseAppLogin reply_id лежит со смещения 9
+# (после 2-байтного счётчика/длины). Подтверждено из логов.
+BASEAPP_REPLYID_OFFSET = 9
 
 # ───────────────────────────────────────────────────────────────
 #  BigWorld пакетные флаги
@@ -295,12 +325,15 @@ def build_bw_packet(
     last_rel: int = 0,
     extra_flags: int = 0,
     prefix_offset: int = 0,
+    raw_prefix: int | None = None,
 ) -> bytes:
     """
     Собирает BigWorld UDP пакет.
     Если is_on_channel = False, seq_num и last_rel НЕ добавляются в footer.
     prefix_offset — channel offset для prefix (0 для LoginApp, per-connection
     для BaseApp; восстанавливается через _recover_prefix_offset).
+    raw_prefix — если задан (не None), использовать это значение напрямую
+    вместо вычисления через _prefix_hash (для диагностики).
     """
     FLAG_HAS_CHECKSUM  = 0x0100
     FLAG_IS_ON_CHANNEL = 0x0008  # Указывает клиенту, что нужно читать seq_num и last_rel
@@ -321,7 +354,37 @@ def build_bw_packet(
     cs = _xor_cs(bytes(body))
     body += struct.pack('<I', cs)       # footer: checksum
 
-    prefix = _prefix_hash(bytes(body), prefix_offset)
+    if raw_prefix is not None:
+        prefix = raw_prefix
+    else:
+        prefix = _prefix_hash(bytes(body), prefix_offset)
+    return struct.pack('<I', prefix) + bytes(body)
+
+
+def _build_bw_packet_no_checksum(
+    elements: bytes,
+    is_on_channel: bool = False,
+    prefix_offset: int = 0,
+    raw_prefix: int | None = None,
+) -> bytes:
+    """Build a BW packet WITHOUT HAS_CHECKSUM flag (for diagnostic variants)."""
+    flags = 0
+    if is_on_channel:
+        flags |= 0x0008  # ON_CHANNEL
+
+    body = bytearray()
+    body += struct.pack('<H', flags)
+    body += elements
+
+    if is_on_channel:
+        body += struct.pack('<I', 0)  # last_rel
+        body += struct.pack('<I', 0)  # seq_num
+
+    # NO checksum appended
+    if raw_prefix is not None:
+        prefix = raw_prefix
+    else:
+        prefix = _prefix_hash(bytes(body), prefix_offset)
     return struct.pack('<I', prefix) + bytes(body)
 
 
@@ -711,7 +774,7 @@ class LoginApp:
 # ───────────────────────────────────────────────────────────────
 class BaseAppStub:
 
-    def __init__(self, def_manager=None):
+    def __init__(self, def_manager=None, *args, **kwargs):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.sock.bind((HOST, BASE_PORT))
@@ -721,6 +784,8 @@ class BaseAppStub:
         self._clients   = {}  # addr → BaseAppHandshake (SYN→ACK автомат)
         self.def_manager = def_manager  # ← .def registry reference
         self._entity_stream_sent = set()
+        self._channels = {}
+        self._sessions = {}
 
         # ── Параметры Account entity (createBasePlayer) ──────────────────
         # required_version ОБЯЗАН совпасть с версией, которую ждёт клиент,
@@ -755,6 +820,42 @@ class BaseAppStub:
             self.entity_system.initialize()
         
         print(f'[BASE]  Listening  UDP {HOST}:{BASE_PORT}')
+    
+    def _send_on_channel(self, addr, ch, element: bytes):
+        """Отправить on-channel элемент с правильным seq + CREATE_CHANNEL на первом."""
+        extra = 0
+        if ch.first_channel_pkt:
+            extra = FLAG_CREATE_CHANNEL      # ← раскрывает sliding window у клиента
+            ch.first_channel_pkt = False
+        pkt = build_bw_packet(
+            element,
+            is_on_channel = True,
+            seq_num       = ch.next_seq(),   # ← seq РАСТЁТ
+            last_rel      = ch.client_seq,   # ← подтверждаем последний seq клиента
+            extra_flags   = extra,
+            prefix_offset = 0,               # наш TX offset всегда 0
+        )
+        self.sock.sendto(pkt, addr)
+        return pkt
+
+    def _send_player_bootstrap(self, addr, ch):
+        # 1) createBasePlayer(Account)
+        el = build_account_create_base_player_element(
+            entity_id=self.account_entity_id,
+            required_version=self.required_version,
+            name=self.account_name,
+        )
+        self._send_on_channel(addr, ch, el)
+
+        # 2) receiveProperties (stats/inventory/serverSettings)
+        rp_elem, _ = build_receive_properties_element(self.account_entity_id)
+        self._send_on_channel(addr, ch, rp_elem)
+
+        # 3) showGUI(ctx) → Ангар
+        payload, _ = build_show_gui_payload(
+            database_id=self.database_id,
+            account_schema=self.account_schema, root_path='.')
+        self._send_on_channel(addr, ch, payload)
 
     def _log(self, msg: str, addr=None, level: str = 'INFO'):
         tag  = f'[{addr[0]}:{addr[1]}]' if addr else ''
@@ -769,6 +870,12 @@ class BaseAppStub:
     def run(self):
         with open(self._log_path, 'w', encoding='utf-8') as f:
             f.write(f'=== Started {time.strftime("%Y-%m-%d %H:%M:%S")} ===\n')
+        # Очистить дампы пакетов
+        try:
+            with open(os.path.join(LOG_DIR, 'baseapp_packets.hex'), 'w', encoding='utf-8') as f:
+                f.write(f'=== Started {time.strftime("%Y-%m-%d %H:%M:%S")} ===\n')
+        except Exception:
+            pass
         self._log('BaseApp stub started')
         while True:
             try:
@@ -780,92 +887,81 @@ class BaseAppStub:
                 traceback.print_exc()
 
     def _dispatch(self, data: bytes, addr):
-        """BaseApp dispatch.
+        if not hasattr(self, '_channels'):
+            self._channels = {}
+        if not hasattr(self, '_sessions'):
+            self._sessions = {}
+        if not hasattr(self, '_login_attempt'):
+            self._login_attempt = {}
 
-        Раскладка входящего baseAppLogin (off-channel request, проверено по
-        реальному дампу клиента + wg-toolkit base/element.rs):
+        # ── ПОЛНОЕ ЛОГИРОВАНИЕ входящих пакетов ──────────────────────
+        try:
+            with open(os.path.join(LOG_DIR, 'baseapp_packets.hex'), 'a', encoding='utf-8') as f:
+                f.write(f'{data[:4].hex()} | {data.hex()} | {len(data)}\n')
+        except Exception:
+            pass
+        self._log(f'<< RECV {len(data)}B', addr)
+        if len(data) >= 7:
+            self._log(f'   flags=0x{struct.unpack_from("<H", data, 4)[0]:04X} '
+                      f'elt_id=0x{data[6]:02X}', addr)
 
-            [prefix:4][flags:2 = 0x0001 HAS_REQUESTS]
-              [msg_id:1 = 0x00 LOGIN_KEY]
-              [reply_id:4]            request id
-              [next_req_off:2]        0 = нет следующего request
-              [LoginKey Fixed(7): login_key u32, attempt_num u8, unk u16]
-            [footer: first_request_offset:2]   ; offset от начала flags
-
-        Клиент ждёт REPLY с SessionKey (u32). Раньше сервер слал prereq
-        (00 00) on-channel+checksum — клиент это отвергал ⇒
-        LOGIN_REJECTED_NO_BASEAPP_RESPONSE. Теперь шлём off-channel reply
-        с session_key (как рабочий LoginApp), затем — createBasePlayer.
-        """
-        self._log(f'<< Recv {len(data)}B hex={data[:32].hex(" ")}', addr)
-
-        if len(data) < 6:
-            return
+        # ── Восстановить channel offset клиента из его prefix ──────
+        client_offset = _recover_prefix_offset(data)
+        client_prefix_raw = struct.unpack_from('<I', data, 0)[0]
+        self._log(f'   client_prefix_offset=0x{client_offset:08X}  raw_prefix=0x{client_prefix_raw:08X}', addr)
 
         flags = struct.unpack_from('<H', data, 4)[0]
+        ch = self._channels.setdefault(addr, ClientChannel())
+        ch.last_client_prefix = client_prefix_raw
 
-        # baseAppLogin — REQUEST с флагом HAS_REQUESTS.
-        if (flags & FLAG_HAS_REQUESTS) and len(data) >= 13:
-            msg_id   = data[6]                                   # 0x00 = LOGIN_KEY
-            reply_id = struct.unpack_from('<I', data, 7)[0]      # request id
-            # next_req_off = struct.unpack_from('<H', data, 11)[0]  # = 0
+        # ── ФАЗА 1: Обработка off-channel baseAppLogin ──────
+        if (flags & FLAG_HAS_REQUESTS) and len(data) >= 14:
+            request_id = struct.unpack_from('<I', data, 6)[0]
+            elt_id = data[12]
 
-            if msg_id != 0x00:
-                self._log(f'⚠️  Неизвестный baseApp msg_id={msg_id:#04x}', addr,
-                          level='WARN')
+            self._log(f'   request_id=0x{request_id:08X} elt_id=0x{elt_id:02X}', addr)
 
-            # channel offset восстанавливаем из prefix входящего пакета —
-            # без него клиент посчитает другой ожидаемый prefix и дропнет ответ.
-            # ⚠️ FIX (prefix offset): сервер ДОЛЖЕН слать с offset=0, как LoginApp.
-            # Доказано: (1) LoginApp у нас работает на offset=0; (2) wg-toolkit master
-            # packet.rs::update_prefix явно «always use zero» и так заходит в живой
-            # клиент. Клиент шлёт СВОИ пакеты со своим per-connection offset, но НЕ
-            # требует, чтобы сервер его повторял. Раньше мы слали ответы с offset
-            # клиента (recovered) → prefix не сходился → клиент молча дропал reply →
-            # спам baseAppLogin → LOGIN_REJECTED_NO_BASEAPP_RESPONSE.
-            client_tx_offset = _recover_prefix_offset(data)   # offset КЛИЕНТА (для лога)
-            self._prefix_offsets[addr] = client_tx_offset
-            prefix_offset = 0                                  # ← наш TX offset = 0
-            self._log(f'client_tx_offset={client_tx_offset:#010x}  '
-                      f'our_tx_offset=0x00000000 (wg-toolkit)', addr)
+            if elt_id in (0x00, 0x02):  # LoginKey
+                # DETERMINISTIC LoginKey -> SessionKey reply (per wg-toolkit)
+                # Reply to BaseApp LoginKey(0x00) MUST be one SessionKey(0x01,
+                # Fixed(4)) element as a REPLY (reply_id == request_id).
+                attempt = self._login_attempt.get(addr, 0)
+                self._login_attempt[addr] = attempt + 1
+                login_key_client = struct.unpack_from('<I', data, 13)[0] if len(data) >= 17 else 0
+                self._log(f'   login_key_from_client=0x{login_key_client:08X}', addr)
+                session_key = self._sessions.get(addr)
+                if session_key is None:
+                    session_key = struct.unpack('<I', os.urandom(4))[0]
+                    self._sessions[addr] = session_key
+                sk  = struct.pack('<I', session_key)
+                elt = build_reply_element(request_id, sk)
+                pkt = build_bw_packet(elt, is_on_channel=False, prefix_offset=0)
+                sent = self.sock.sendto(pkt, addr)
+                self._log(f'>> SessionKey key=0x{session_key:08X} req_id=0x{request_id:08X} login_key=0x{login_key_client:08X} ({len(pkt)}B) sent={sent}', addr)
+                self._log(f'   reply hex={pkt.hex(chr(32))}', addr)
+                return
 
-            # session_key выдаётся ОДИН раз на клиента и потом им же
-            # возвращается (SessionKey, id 0x01) уже по каналу.
-            session_key = self._sessions.get(addr)
-            if session_key is None:
-                session_key = struct.unpack('<I', os.urandom(4))[0]
-                self._sessions[addr] = session_key
-                self._log(f'Новый клиент, session_key={session_key:#010x} '
-                          f'prefix_offset={prefix_offset:#010x}', addr)
+            elif elt_id == 0x01:  # SessionKey from client (confirmation)
+                self._log('<< Client SessionKey confirmation', addr)
+                return
 
-            # --- REPLY: SessionKey(u32) ----------------------------------
-            # Reply-элемент: [0xFF][var32 len][reply_id:4][session_key:4].
-            # OFF-CHANNEL + checksum (is_on_channel=False) — как LoginApp.
-            # prefix_offset ОБЯЗАТЕЛЕН, иначе клиент дропнет пакет.
-            reply_payload = struct.pack('<I', session_key)       # SessionKey Fixed(4)
-            elem  = build_reply_element(reply_id, reply_payload)
-            reply = build_bw_packet(elem, is_on_channel=False,
-                                    prefix_offset=prefix_offset)
+            else:
+                self._log(f'   ⚠ Unknown elt_id=0x{elt_id:02X}', addr, 'WARN')
+                return
 
-            self._log(f'baseAppLogin request_id={reply_id} '
-                      f'session_key={session_key:#010x}', addr)
-            self._log(f'>> SessionKey reply ({len(reply)}B) hex={reply.hex(" ")}', addr)
-            self.sock.sendto(reply, addr)
+        # ── ФАЗА 2: on-channel пакеты после установки канала ─────
+        if (flags & FLAG_IS_ON_CHANNEL):
+            ch.client_seq = _client_seq_from_packet(data)
+            msg_id = data[6] if len(data) > 6 else None
 
-            # --- createBasePlayer (Account), ОДИН раз --------------------
-            if addr not in self._entity_streams_sent:
-                self._entity_streams_sent.add(addr)
-                entity_stream = self._generate_account_entity_stream(
-                    reply_id, 0, prefix_offset=prefix_offset)
-                self.sock.sendto(entity_stream, addr)
-                self._log(f'>> createBasePlayer(Account) ({len(entity_stream)}B) '
-                          f'hex={entity_stream[:48].hex(" ")}', addr)
+            if not ch.established and msg_id == 0x01:
+                ch.established = True
+                self._log('канал установлен (on-channel SessionKey 0x01)', addr)
+                self._send_player_bootstrap(addr, ch)
+                return
 
-                # --- showGUI(ctx) -> вход в Ангар, СРАЗУ после createBasePlayer ----
-                self._send_show_gui(addr, prefix_offset)
-        else:
-            # Не-request пакет по каналу (ACK / SessionKey echo) — пока no-op.
-            self._log('<< не-request пакет (ack/keep-alive), игнор', addr)
+            self._send_ack(addr, ch)
+            return
 
 
     def _generate_account_entity_stream(self, request_id: int, client_seq: int,
@@ -946,12 +1042,12 @@ class BaseAppStub:
             f'element_id=0x{dbg["element_id"]:02X} sub_id={dbg["sub_id"]} '
             f'db_id={self.database_id} hex={pkt[:48].hex(" ")}', addr)
 
-    def _send_ack(self, addr, req_id: int, client_seq: int):
+    def _send_ack(self, addr, ch):
         """Пустой ACK — подтверждаем что пакет получен."""
-        pkt = build_bw_packet(b'', is_on_channel=True, seq_num=self._seq, last_rel=client_seq)
-        self._seq += 1
+        pkt = build_bw_packet(b'', is_on_channel=True,
+                              seq_num=ch.next_seq(), last_rel=ch.client_seq,
+                              prefix_offset=0)
         self.sock.sendto(pkt, addr)
-        self._log(f'>> ACK ({len(pkt)}B)', addr)
 
     def _send_prereq_reply(self, addr, req_id: int, client_seq: int):
         """
