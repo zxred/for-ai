@@ -77,7 +77,7 @@ def _client_seq_from_packet(data: bytes) -> int:
 # sys.path, чтобы импорт работал независимо от cwd.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from entity_streaming import build_account_create_base_player_element
-from account_properties import send_receive_properties   # stats/inventory/serverSettings
+from account_properties import send_receive_properties, build_receive_properties_element   # stats/inventory/serverSettings
 
 sys.stdout.reconfigure(line_buffering=True)
 
@@ -945,12 +945,13 @@ class BaseAppStub:
                 if not hasattr(self, '_bootstrapped'):
                     self._bootstrapped = set()
                 if addr not in self._bootstrapped:
-                    self._bootstrapped.add(addr)
                     try:
                         self._send_player_bootstrap(addr, ch)
+                        self._bootstrapped.add(addr)
                         self._log('>> player bootstrap sent (CreateBasePlayer/receiveProperties/showGUI)', addr)
                     except Exception as e:
-                        self._log(f'   bootstrap error: {e}', addr)
+                        import traceback as _tb
+                        self._log(f'   bootstrap error: {e} | {_tb.format_exc()}', addr)
                 return
 
             elif elt_id == 0x01:  # SessionKey from client (confirmation)
