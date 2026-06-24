@@ -940,6 +940,17 @@ class BaseAppStub:
                 sent = self.sock.sendto(pkt, addr)
                 self._log(f'>> SessionKey key=0x{session_key:08X} req_id=0x{request_id:08X} login_key=0x{login_key_client:08X} ({len(pkt)}B) sent={sent}', addr)
                 self._log(f'   reply hex={pkt.hex(chr(32))}', addr)
+                # After auth the client expects player bootstrap
+                # (CreateBasePlayer / receiveProperties / showGUI).
+                if not hasattr(self, '_bootstrapped'):
+                    self._bootstrapped = set()
+                if addr not in self._bootstrapped:
+                    self._bootstrapped.add(addr)
+                    try:
+                        self._send_player_bootstrap(addr, ch)
+                        self._log('>> player bootstrap sent (CreateBasePlayer/receiveProperties/showGUI)', addr)
+                    except Exception as e:
+                        self._log(f'   bootstrap error: {e}', addr)
                 return
 
             elif elt_id == 0x01:  # SessionKey from client (confirmation)
