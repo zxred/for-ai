@@ -897,10 +897,14 @@ class BaseAppStub:
         # Шифруем ВСЁ тело между flags и checksum.
         # flags (2B) остаются открытыми, checksum считается от шифрованного тела.
         if ch.bf_key is not None:
-            plain_body = bytes(body[2:])  # без flags
-            pad = (8 - len(plain_body) % 8) % 8
-            padded = plain_body + b'\x00' * pad
-            enc_body = ch._bf_enc.encrypt(padded)[:len(plain_body)]
+            # BigWorld EncryptionFilter wastage scheme (Variant A):
+            # pad to 8B; last byte = wastage count (1..8); encrypt FULL blocks.
+            # Client strips last «wastage» bytes after decrypt -> footer offsets line up.
+            plain_body = bytes(body[2:])  # element + last_rel + seq, без flags
+            size = len(plain_body)
+            wastage = 8 - (size % 8)            # 1..8, всегда есть счётчик
+            padded = plain_body + b'\x00' * (wastage - 1) + bytes([wastage])
+            enc_body = ch._bf_enc.encrypt(padded)   # FULL blocks, NO truncation
             body = bytearray(struct.pack('<H', flags)) + bytearray(enc_body)
 
         cs = _xor_cs(bytes(body))
