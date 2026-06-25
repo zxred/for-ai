@@ -165,7 +165,7 @@ SEND_SEPARATE_REDIRECT = False   # True = слать LoginRedirect вторым 
 REDIRECT_DELAY_SEC     = 0.08    # задержка перед redirect (клиенту на расшифровку)
 ENCRYPT_SUCCESS        = True    # False = LoginSuccess без Blowfish (диагностика)
 BASEAPP_BF_KEY        = None    # FIX: real 16B client Blowfish key, shared LoginApp->BaseApp
-BASEAPP_USE_CHECKSUM  = False   # FIX: client sends flags=0x0001 (NO checksum) -> replies must omit it too
+BASEAPP_USE_CHECKSUM  = True    # EVIDENCE: the ONLY reply the client accepted (LoginApp) had flags=0x0100 + checksum; mirror that framing
 LOGIN_KEY              = 0x00000001  # sessionKey-поле внутри LoginReplyRecord
 
 # Источник Blowfish-ключа для шифрования LoginSuccess:
@@ -891,7 +891,7 @@ class BaseAppStub:
             ch.first_channel_pkt = False
 
         seq     = ch.next_seq()
-        flags   = (0x0100 if BASEAPP_USE_CHECKSUM else 0) | 0x0008 | extra  # FIX: gate HAS_CHECKSUM  # HAS_CHECKSUM | IS_ON_CHANNEL
+        flags   = (0x0100 if BASEAPP_USE_CHECKSUM else 0) | 0x0008 | 0x0040 | 0x1000 | extra  # ON_CHANNEL|HAS_SEQ|UNK_1000(last_rel) per wg-toolkit footer spec
         offset  = getattr(ch, 'prefix_offset', 0)
 
         body = bytearray()
@@ -908,7 +908,7 @@ class BaseAppStub:
         else:
             body += element
 
-        body += struct.pack('<I', ch.client_seq)    # last_rel: CLEAR
+        body += struct.pack('<I', ch.client_seq if ch.client_seq else 0xFFFFFFFF)    # last_rel: CLEAR, initial=-1
         body += struct.pack('<I', seq)              # seq_num: CLEAR
 
         if BASEAPP_USE_CHECKSUM:
