@@ -47,10 +47,47 @@ except Exception:
 class ClientChannel:
     """Состояние reliable-канала одного клиента (wg-toolkit ClientChannel)."""
     def __init__(self):
-        self.established   = False   # пришёл ли on-channel SessionKey (0x01)
-        self.our_seq       = 0       # наш счётчик исходящих reliable-пакетов
-        self.client_seq    = 0       # последний seq, полученный от клиента (для last_rel)
-        self.first_channel_pkt = True  # нужен флаг CREATE_CHANNEL на 1-м пакете
+        self.established       = False   # пришёл ли on-channel SessionKey (0x01)
+        self.our_seq           = 0       # наш счётчик исходящих reliable-пакетов
+        self.client_seq        = 0       # последний seq, полученный от клиента
+        self.first_channel_pkt = True    # нужен FLAG_CREATE_CHANNEL на 1-м пакете
+        self.prefix_offset     = 0       # per-connection offset (из prefix клиента)
+        # Blowfish канального шифрования
+        # Ключ = session_key из SessionKey reply (4 байта, паддинг до 8).
+        # После установки SessionKey ВСЕ on-channel тела шифруются BF.
+        self.bf_key: bytes | None = None # None = не установлен (до SessionKey)
+        self._bf_enc: object | None = None  # BlowfishLesta instance
+        self._bf_dec: object | None = None
+
+    def setup_blowfish(self, session_key: int):
+        """Инициализировать BF после согласования SessionKey."""
+        # Ключ = session_key (4B LE) дополнен зеркально до 8 байт.
+        # wg-toolkit: key = session_key_bytes * 2 (repeat 4B twice → 8B).
+        sk = struct.pack('<I', session_key)
+        # FIX: use the REAL 16-byte client Blowfish key established at login
+        # (parsed from RSA blob in LoginApp). The old sk*2 was a fake 8B key.
+        if BASEAPP_BF_KEY:
+            self.bf_key = BASEAPP_BF_KEY
+        else:
+            self.bf_key = sk * 2   # fallback (diagnostic only)
+        self._bf_enc = BlowfishLesta(self.bf_key)
+        self._bf_dec = BlowfishLesta(self.bf_key)
+
+    def encrypt_body(self, body: bytes) -> bytes:
+        """Зашифровать тело on-channel пакета (после flags, до checksum)."""
+        if self._bf_enc is None:
+            return body
+        pad = (8 - len(body) % 8) % 8
+        padded = body + b'\x00' * pad
+        return self._bf_enc.encrypt(padded)[:len(body)]
+
+    def decrypt_body(self, body: bytes) -> bytes:
+        """Расшифровать тело входящего on-channel пакета."""
+        if self._bf_dec is None:
+            return body
+        pad = (8 - len(body) % 8) % 8
+        padded = body + b'\x00' * pad
+        return self._bf_dec.decrypt(padded)[:len(body)]
 
     def next_seq(self) -> int:
         s = self.our_seq
@@ -127,6 +164,7 @@ from auth_logic import (
 SEND_SEPARATE_REDIRECT = False   # True = слать LoginRedirect вторым пакетом
 REDIRECT_DELAY_SEC     = 0.08    # задержка перед redirect (клиенту на расшифровку)
 ENCRYPT_SUCCESS        = True    # False = LoginSuccess без Blowfish (диагностика)
+BASEAPP_BF_KEY        = None    # FIX: real 16B client Blowfish key, shared LoginApp->BaseApp
 LOGIN_KEY              = 0x00000001  # sessionKey-поле внутри LoginReplyRecord
 
 # Источник Blowfish-ключа для шифрования LoginSuccess:
@@ -310,13 +348,16 @@ def build_reply_element(request_id: int, payload: bytes) -> bytes:
     """
     Reply element (wg-toolkit-rs bundle.rs):
       [0xFF : 1B]
-      [var32(len(req_id+payload)) : 1-4B]
+      [var32(len(req_id+payload)) : 1-4B]   ← VARIABLE32, не Fixed4!
       [request_id : 4B LE]
       [payload]
+
+    КРИТИЧНО: клиент читает длину как Variable32 (1 байт если <128).
+    Fixed4 (08 00 00 00) сдвигает req_id на 3 байта → клиент дропает пакет.
+    Для SessionKey: content=8 байт → var32=0x08 (1 байт).
     """
-    # FIX #1: длина reply — 4-байтовый LE u32 (wg-toolkit), не упакованный var32.
     content = struct.pack('<I', request_id) + payload
-    return b'\xFF' + struct.pack('<I', len(content)) + content
+    return b'\xFF' + encode_var32(len(content)) + content
 
 
 def build_bw_packet(
@@ -330,30 +371,37 @@ def build_bw_packet(
 ) -> bytes:
     """
     Собирает BigWorld UDP пакет.
-    Если is_on_channel = False, seq_num и last_rel НЕ добавляются в footer.
-    prefix_offset — channel offset для prefix (0 для LoginApp, per-connection
-    для BaseApp; восстанавливается через _recover_prefix_offset).
-    raw_prefix — если задан (не None), использовать это значение напрямую
-    вместо вычисления через _prefix_hash (для диагностики).
+
+    OFF-CHANNEL (is_on_channel=False):
+      flags = HAS_CHECKSUM(0x0100) | extra_flags
+      body  = flags(2) + elements + checksum(4)
+      Итого для SessionKey reply = 4+2+1+1+4+4+4 = 20 байт.
+
+    ON-CHANNEL (is_on_channel=True):
+      flags = HAS_CHECKSUM | FLAG_IS_ON_CHANNEL(0x0008) | extra_flags
+      body  = flags(2) + elements + last_rel(4) + seq_num(4) + checksum(4)
+
+    prefix = _prefix_hash(body, prefix_offset)
+    prefix_offset — per-connection offset клиента (восстанавливается из входящего prefix).
+    НЕЛЬЗЯ использовать offset=0 для BaseApp — клиент дропнет пакет.
     """
     FLAG_HAS_CHECKSUM  = 0x0100
-    FLAG_IS_ON_CHANNEL = 0x0008  # Указывает клиенту, что нужно читать seq_num и last_rel
+    FLAG_IS_ON_CHANNEL = 0x0008
 
     flags = FLAG_HAS_CHECKSUM | extra_flags
     if is_on_channel:
         flags |= FLAG_IS_ON_CHANNEL
 
     body = bytearray()
-    body += struct.pack('<H', flags)    # flags
-    body += elements                   # element area
+    body += struct.pack('<H', flags)
+    body += elements
 
-    # Добавляем seq-номера только если пакет канальный (BaseApp/CellApp)
     if is_on_channel:
         body += struct.pack('<I', last_rel)
         body += struct.pack('<I', seq_num)
 
     cs = _xor_cs(bytes(body))
-    body += struct.pack('<I', cs)       # footer: checksum
+    body += struct.pack('<I', cs)
 
     if raw_prefix is not None:
         prefix = raw_prefix
@@ -704,6 +752,7 @@ class LoginApp:
         self._log(f'   bf_key cand: first16={bf_first16} prejson={bf_prejson} postjson={bf_postjson}', addr)
         if   BF_KEY_SOURCE == 'blob'     and bf_blob:
             bf_key = bytes.fromhex(bf_blob)
+            globals()['BASEAPP_BF_KEY'] = bf_key   # FIX: share real key with BaseApp
         elif BF_KEY_SOURCE == 'first16'  and bf_first16:
             bf_key = bytes.fromhex(bf_first16)
         elif BF_KEY_SOURCE == 'prejson'  and bf_prejson:
@@ -823,20 +872,49 @@ class BaseAppStub:
         print(f'[BASE]  Listening  UDP {HOST}:{BASE_PORT}')
     
     def _send_on_channel(self, addr, ch, element: bytes):
-        """Отправить on-channel элемент с правильным seq + CREATE_CHANNEL на первом."""
+        """Отправить on-channel элемент с правильным seq + CREATE_CHANNEL на первом.
+
+        После установки SessionKey тело пакета (от flags до checksum)
+        шифруется Blowfish (Lesta PCBC). Это то что клиент ожидает после
+        согласования туннеля — иначе дропает все пакеты.
+        """
         extra = 0
         if ch.first_channel_pkt:
-            extra = FLAG_CREATE_CHANNEL      # ← раскрывает sliding window у клиента
+            extra = FLAG_CREATE_CHANNEL
             ch.first_channel_pkt = False
-        pkt = build_bw_packet(
-            element,
-            is_on_channel = True,
-            seq_num       = ch.next_seq(),   # ← seq РАСТЁТ
-            last_rel      = ch.client_seq,   # ← подтверждаем последний seq клиента
-            extra_flags   = extra,
-            prefix_offset = getattr(ch, 'prefix_offset', 0),   # FIX: use client per-connection offset
-        )
+
+        seq     = ch.next_seq()
+        flags   = 0x0100 | 0x0008 | extra  # HAS_CHECKSUM | IS_ON_CHANNEL
+        offset  = getattr(ch, 'prefix_offset', 0)
+
+        body = bytearray()
+        body += struct.pack('<H', flags)
+        body += element
+        body += struct.pack('<I', ch.client_seq)   # last_rel
+        body += struct.pack('<I', seq)             # seq_num
+
+        # ── Blowfish шифрование тела после установки SessionKey ──────────
+        # Шифруем ВСЁ тело между flags и checksum.
+        # flags (2B) остаются открытыми, checksum считается от шифрованного тела.
+        if ch.bf_key is not None:
+            plain_body = bytes(body[2:])  # без flags
+            pad = (8 - len(plain_body) % 8) % 8
+            padded = plain_body + b'\x00' * pad
+            enc_body = ch._bf_enc.encrypt(padded)[:len(plain_body)]
+            body = bytearray(struct.pack('<H', flags)) + bytearray(enc_body)
+
+        cs = _xor_cs(bytes(body))
+        body += struct.pack('<I', cs)
+
+        prefix = _prefix_hash(bytes(body), offset)
+        pkt = struct.pack('<I', prefix) + bytes(body)
+
         self.sock.sendto(pkt, addr)
+        self._log(
+            f'>> on-channel seq={seq} {len(pkt)}B bf={"ON" if ch.bf_key else "OFF"} '
+            f'hex={pkt[:24].hex(" ")}',
+            addr
+        )
         return pkt
 
     def _send_player_bootstrap(self, addr, ch):
@@ -936,18 +1014,43 @@ class BaseAppStub:
                 if session_key is None:
                     session_key = struct.unpack('<I', os.urandom(4))[0]
                     self._sessions[addr] = session_key
+
+                # Строим SessionKey reply:
+                # [prefix:4][flags=0x0100:2][0xFF:1][var32(8)=0x08:1][req_id:4][sess:4][cs:4]
+                # = 20 байт. БЕЗ seq/last_rel (off-channel пакет).
+                # prefix_offset = client_offset (КРИТИЧНО — иначе клиент дропает).
                 sk  = struct.pack('<I', session_key)
-                elt = build_reply_element(request_id, sk)
-                pkt = build_bw_packet(elt, is_on_channel=False, prefix_offset=client_offset)
+                elt = build_reply_element(request_id, sk)  # теперь var32, не fixed4
+                pkt = build_bw_packet(
+                    elt,
+                    is_on_channel  = False,       # off-channel: нет seq/last_rel
+                    prefix_offset  = client_offset,  # КРИТИЧНО: client's offset
+                )
                 sent = self.sock.sendto(pkt, addr)
-                self._log(f'>> SessionKey key=0x{session_key:08X} req_id=0x{request_id:08X} login_key=0x{login_key_client:08X} ({len(pkt)}B) sent={sent}', addr)
+                self._log(
+                    f'>> SessionKey key=0x{session_key:08X} req_id=0x{request_id:08X} '
+                    f'({len(pkt)}B, var32 encoding)', addr
+                )
                 self._log(f'   reply hex={pkt.hex(chr(32))}', addr)
+
+                # ── Устанавливаем Blowfish туннель ────────────────────────
+                # После первого SessionKey reply все on-channel пакеты шифруются.
+                # Ключ = session_key (4B) * 2 = 8 байт (Lesta PCBC mode).
+                ch.setup_blowfish(session_key)
+                self._log(
+                    f'   Blowfish tunnel armed: key={ch.bf_key.hex()} '
+                    f'(session_key=0x{session_key:08X} x2)',
+                    addr
+                )
+
                 # After auth the client expects player bootstrap
                 # (CreateBasePlayer / receiveProperties / showGUI).
+                # Небольшая задержка чтобы клиент успел принять SessionKey.
                 if not hasattr(self, '_bootstrapped'):
                     self._bootstrapped = set()
                 if addr not in self._bootstrapped:
                     try:
+                        time.sleep(0.05)  # 50ms — клиент принимает SessionKey
                         self._send_player_bootstrap(addr, ch)
                         self._bootstrapped.add(addr)
                         self._log('>> player bootstrap sent (CreateBasePlayer/receiveProperties/showGUI)', addr)
