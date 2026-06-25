@@ -358,7 +358,11 @@ def build_reply_element(request_id: int, payload: bytes) -> bytes:
     Для SessionKey: content=8 байт → var32=0x08 (1 байт).
     """
     content = struct.pack('<I', request_id) + payload
-    return b'\xFF' + encode_var32(len(content)) + content
+    # FIX (wg-toolkit element.rs): Reply uses ElementLength::Variable32 =
+    # a FIXED 4-byte LE length field (read_u32), NOT a 7-bit varint.
+    # Prev session wrongly used encode_var32 (1 byte for 8) -> client read
+    # length as 4 bytes (08 61 07 01) = garbage -> dropped packet -> retry.
+    return b'\xFF' + struct.pack('<I', len(content)) + content
 
 
 def build_bw_packet(
