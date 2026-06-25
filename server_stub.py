@@ -891,7 +891,7 @@ class BaseAppStub:
             ch.first_channel_pkt = False
 
         seq     = ch.next_seq()
-        flags   = 0x0100 | 0x0008 | extra  # HAS_CHECKSUM | IS_ON_CHANNEL
+        flags   = (0x0100 if BASEAPP_USE_CHECKSUM else 0) | 0x0008 | extra  # FIX: gate HAS_CHECKSUM  # HAS_CHECKSUM | IS_ON_CHANNEL
         offset  = getattr(ch, 'prefix_offset', 0)
 
         body = bytearray()
