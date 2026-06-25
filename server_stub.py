@@ -888,24 +888,21 @@ class BaseAppStub:
         offset  = getattr(ch, 'prefix_offset', 0)
 
         body = bytearray()
-        body += struct.pack('<H', flags)
-        body += element
-        body += struct.pack('<I', ch.client_seq)   # last_rel
-        body += struct.pack('<I', seq)             # seq_num
+        body += struct.pack('<H', flags)            # flags: CLEAR
 
-        # ── Blowfish шифрование тела после установки SessionKey ──────────
-        # Шифруем ВСЁ тело между flags и checksum.
-        # flags (2B) остаются открытыми, checksum считается от шифрованного тела.
+        # FIX: encrypt ONLY the message payload (like working LoginSuccess).
+        # Framing stays CLEAR: flags + footer(last_rel/seq) + checksum, so the
+        # client reads channel seq WITHOUT decrypting and tracks the channel.
         if ch.bf_key is not None:
-            # BigWorld EncryptionFilter wastage scheme (Variant A):
-            # pad to 8B; last byte = wastage count (1..8); encrypt FULL blocks.
-            # Client strips last «wastage» bytes after decrypt -> footer offsets line up.
-            plain_body = bytes(body[2:])  # element + last_rel + seq, без flags
-            size = len(plain_body)
-            wastage = 8 - (size % 8)            # 1..8, всегда есть счётчик
-            padded = plain_body + b'\x00' * (wastage - 1) + bytes([wastage])
-            enc_body = ch._bf_enc.encrypt(padded)   # FULL blocks, NO truncation
-            body = bytearray(struct.pack('<H', flags)) + bytearray(enc_body)
+            size = len(element)
+            wastage = 8 - (size % 8)             # 1..8, always a counter byte
+            padded = bytes(element) + b'\x00' * (wastage - 1) + bytes([wastage])
+            body += ch._bf_enc.encrypt(padded)   # encrypted payload, FULL blocks
+        else:
+            body += element
+
+        body += struct.pack('<I', ch.client_seq)    # last_rel: CLEAR
+        body += struct.pack('<I', seq)              # seq_num: CLEAR
 
         cs = _xor_cs(bytes(body))
         body += struct.pack('<I', cs)
@@ -1050,14 +1047,15 @@ class BaseAppStub:
                 # After auth the client expects player bootstrap
                 # (CreateBasePlayer / receiveProperties / showGUI).
                 # Небольшая задержка чтобы клиент успел принять SessionKey.
-                if not hasattr(self, '_bootstrapped'):
-                    self._bootstrapped = set()
-                if addr not in self._bootstrapped:
+                # FIX: re-send bootstrap on EVERY LoginKey retry until the client
+                # establishes the channel. UDP may drop/reject packets; the client
+                # only stops resending LoginKey once it accepts a valid on-channel pkt.
+                if True:
                     try:
-                        time.sleep(0.05)  # 50ms — клиент принимает SessionKey
+                        time.sleep(0.05)  # 50ms
+                        ch.first_channel_pkt = True   # re-arm CREATE_CHANNEL each burst
                         self._send_player_bootstrap(addr, ch)
-                        self._bootstrapped.add(addr)
-                        self._log('>> player bootstrap sent (CreateBasePlayer/receiveProperties/showGUI)', addr)
+                        self._log('>> player bootstrap (re)sent (CreateBasePlayer/receiveProperties/showGUI)', addr)
                     except Exception as e:
                         import traceback as _tb
                         self._log(f'   bootstrap error: {e} | {_tb.format_exc()}', addr)
