@@ -1028,8 +1028,17 @@ class BaseAppStub:
                 # [prefix:4][flags=0x0100:2][0xFF:1][var32(8)=0x08:1][req_id:4][sess:4][cs:4]
                 # = 20 байт. БЕЗ seq/last_rel (off-channel пакет).
                 # prefix_offset = client_offset (КРИТИЧНО — иначе клиент дропает).
+                # Set up Blowfish FIRST, then ENCRYPT the SessionKey reply.
+                # wg-toolkit element.rs: LoginKey is the ONLY un-encrypted element;
+                # every reply (incl. SessionKey) is Blowfish-encrypted (blob key).
+                ch.setup_blowfish(session_key)
                 sk  = struct.pack('<I', session_key)
-                elt = build_reply_element(request_id, sk)  # теперь var32, не fixed4
+                if ch.bf_key is not None:
+                    _enc = BlowfishLesta(ch.bf_key)   # fresh state, dont touch on-channel cipher
+                    _w = 8 - (len(sk) % 8)            # 1..8 wastage counter
+                    _padded = sk + b'\x00' * (_w - 1) + bytes([_w])
+                    sk = _enc.encrypt(_padded)        # encrypted SessionKey payload
+                elt = build_reply_element(request_id, sk)  # encrypted reply payload
                 pkt = build_bw_packet(
                     elt,
                     is_on_channel  = False,       # off-channel: нет seq/last_rel
