@@ -395,14 +395,14 @@ def build_bw_packet(
 
     flags = (FLAG_HAS_CHECKSUM if BASEAPP_USE_CHECKSUM else 0) | extra_flags
     if is_on_channel:
-        flags |= FLAG_IS_ON_CHANNEL
+        flags |= FLAG_IS_ON_CHANNEL | 0x0040 | 0x1000  # +HAS_SEQUENCE_NUMBER +UNK_1000(last_rel) so client parses footer
 
     body = bytearray()
     body += struct.pack('<H', flags)
     body += elements
 
     if is_on_channel:
-        body += struct.pack('<I', last_rel)
+        body += struct.pack('<I', last_rel if last_rel else 0xFFFFFFFF)  # initial channel value = -1
         body += struct.pack('<I', seq_num)
 
     if BASEAPP_USE_CHECKSUM:
